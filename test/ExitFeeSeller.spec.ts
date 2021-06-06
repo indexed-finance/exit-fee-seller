@@ -3,6 +3,7 @@ import { expect } from "chai";
 import { ExitFeeSeller, IERC20, IOracle, TestDNDX, IUniswapV2Router } from '../typechain';
 import { advanceTimeAndBlock, deployContract, getContract, impersonate, latest, sendEtherTo, stopImpersonating } from './shared'
 import { BigNumber, constants } from 'ethers';
+import { formatEther, parseEther } from '@ethersproject/units';
 
 const indexTokens = [
   '0x126c121f99e1e211df2e5f8de2d96fa36647c855',
@@ -21,6 +22,17 @@ describe("ExitFeeSeller", function() {
   let dndx: TestDNDX;
   let oracle: IOracle;
   let router: IUniswapV2Router
+
+  async function getBalance(token: string, account: string) {
+    const erc20: IERC20 = await getContract(token, 'IERC20');
+    return erc20.balanceOf(account);
+  }
+
+  async function updatePrice(token: string) {
+    await oracle.updatePrice(token);
+    await advanceTimeAndBlock(7200);
+    await router.swapExactETHForTokens(0, ['0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', token], wallet.address, (await latest()) + 60, { value: BigNumber.from(10).pow(18) });
+  }
 
   before('Deploy ExitFeeSeller', async () => {
     await sendEtherTo(wallet.address, BigNumber.from(10).pow(20));
@@ -72,13 +84,6 @@ describe("ExitFeeSeller", function() {
     })
   })
   
-
-  async function updatePrice(token: string) {
-    await oracle.updatePrice(token);
-    await advanceTimeAndBlock(7200);
-    await router.swapExactETHForTokens(0, ['0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', token], wallet.address, (await latest()) + 60, { value: BigNumber.from(10).pow(18) });
-  }
-  
   describe('sellTokenForETH()', () => {
     it('Should revert if token is ndx', async () => {
       await expect(seller.sellTokenForETH('0x86772b1409b61c639EaAc9Ba0AcfBb6E238e5F83')).to.be.revertedWith('Can not sell NDX')
@@ -88,13 +93,30 @@ describe("ExitFeeSeller", function() {
       await expect(seller.sellTokenForETH('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2')).to.be.revertedWith('Can not sell WETH')
     })
 
-    it('Should revert if no price available on Uniswap', async () => {
+    it('Should revert if no price available on oracle', async () => {
       await expect(seller.sellTokenForETH(indexTokens[0])).to.be.revertedWith('IndexedUniswapV2Oracle::_getTokenPrice: No price found in provided range.')
     })
 
     it('Should sell tokens if output is >= TWAP - discount', async () => {
-      await updatePrice(indexTokens[0]);
-      await seller.sellTokenForETH(indexTokens[0]);
+      for (const token of indexTokens) {
+        await updatePrice(token);
+        await seller.sellTokenForETH(token);
+      }
+      const weth: IERC20 = await getContract('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', 'IERC20')
+      console.log('Received', formatEther(await weth.balanceOf(seller.address)), 'ETH');
+    })
+  })
+
+  describe('buyNDX()', () => {
+    it('Should revert if no price available on oracle', async () => {
+      await expect(seller.buyNDX()).to.be.revertedWith('IndexedUniswapV2Oracle::_getEthPrice: No price found in provided range.')
+    })
+
+    it('Should buy NDX', async () => {
+      await updatePrice('0x86772b1409b61c639EaAc9Ba0AcfBb6E238e5F83')
+      await seller.buyNDX();
+      console.log(formatEther(await getBalance('0x86772b1409b61c639EaAc9Ba0AcfBb6E238e5F83', seller.address)))
+      console.log(formatEther(await getBalance('0x86772b1409b61c639EaAc9Ba0AcfBb6E238e5F83', dndx.address)))
     })
   })
 });

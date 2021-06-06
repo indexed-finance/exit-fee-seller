@@ -24,6 +24,9 @@ export default {
       default: 0,
     },
   },
+  mocha: {
+    timeout: 60000
+  },
   networks: {
     hardhat: {
       allowUnlimitedContractSize: false,

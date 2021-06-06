@@ -32,6 +32,8 @@ contract ExitFeeSeller is Ownable() {
 
   uint16 public twapDiscountBips = 500; // 5%
 
+/* ==========  Structs  ========== */
+
   struct UniswapParams {
     address tokenIn;
     uint256 amountIn;
@@ -45,6 +47,11 @@ contract ExitFeeSeller is Ownable() {
     address[] path;
     uint256 amountOut;
   }
+
+/* ==========  Fallbacks  ========== */
+
+  fallback() external payable { return; }
+  receive() external payable { return; }
 
 /* ==========  Constructor  ========== */
 
@@ -155,7 +162,7 @@ contract ExitFeeSeller is Ownable() {
         address(0),
         0
       );
-      dndx.distribute(uniParams.amountOut);
+      dndx.distribute(bancorParams.amountOut);
     }
   }
 }

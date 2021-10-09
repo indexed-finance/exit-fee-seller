@@ -1,7 +1,7 @@
 import { ethers, waffle } from 'hardhat';
 import { expect } from "chai";
-import { ExitFeeSeller, IERC20, IOracle, TestDNDX, IUniswapV2Router } from '../typechain';
-import { advanceTimeAndBlock, deployContract, getContract, impersonate, latest, sendEtherTo, stopImpersonating } from './shared'
+import { ExitFeeSeller, IDNDX, IERC20, IOracle, IUniswapV2Router, TestERC20 } from '../typechain';
+import { advanceTimeAndBlock, deployContract, getContract, impersonate, latest, sendEtherTo, stopImpersonating, EthPair, getBigNumber, WETH, createTokenWithEthPairs, duration, ORACLE, WETH_ADDRESS, mintWeth, TREASURY_ADDRESS } from './shared'
 import { BigNumber, constants } from 'ethers';
 import { formatEther, parseEther } from '@ethersproject/units';
 
@@ -17,106 +17,251 @@ const indexTokens = [
 const timelock = '0x78a3eF33cF033381FEB43ba4212f2Af5A5A0a2EA';
 
 describe("ExitFeeSeller", function() {
-  const [wallet] = waffle.provider.getWallets();
+  const [wallet, wallet1] = waffle.provider.getWallets();
   let seller: ExitFeeSeller;
-  let dndx: TestDNDX;
-  let oracle: IOracle;
-  let router: IUniswapV2Router
+  let dndx: IDNDX;
+  let token: TestERC20
+  let uni: EthPair, sushi: EthPair;
+  let updatePrice: () => Promise<void>;
 
   async function getBalance(token: string, account: string) {
     const erc20: IERC20 = await getContract(token, 'IERC20');
     return erc20.balanceOf(account);
   }
 
-  async function updatePrice(token: string) {
-    await oracle.updatePrice(token);
-    await advanceTimeAndBlock(7200);
-    await router.swapExactETHForTokens(0, ['0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', token], wallet.address, (await latest()) + 60, { value: BigNumber.from(10).pow(18) });
-  }
-
-  before('Deploy ExitFeeSeller', async () => {
-    await sendEtherTo(wallet.address, BigNumber.from(10).pow(20));
-    await sendEtherTo(timelock, BigNumber.from(10).pow(20));
-    dndx = await deployContract('TestDNDX');
-    seller = await deployContract('ExitFeeSeller', dndx.address);
-    const signer = await impersonate(timelock);
-    for (let token of indexTokens) {
-      const erc20: IERC20 = await getContract(token, 'IERC20', signer);
-      await erc20.approve(seller.address, constants.MaxUint256);
-    }
-    await stopImpersonating(timelock)
-    await seller.transferOwnership(timelock);
-    oracle = await getContract(await seller.oracle(), 'IOracle');
-    router = await getContract('0x7a250d5630b4cf539739df2c5dacb4c659f2488d', 'IUniswapV2Router')
+  beforeEach('Deploy ExitFeeSeller', async () => {
+    dndx = await getContract('0x262cd9ADCE436B6827C01291B84f1871FB8b95A3', 'IDNDX');
+    ({token, uni, sushi, updatePrice} = await createTokenWithEthPairs()) 
+    seller = await deployContract('ExitFeeSeller');
   })
 
-  describe('takeTokensFromOwner', () => {
-    it("Should transfer tokens from owner", async () => {
-      const balances: BigNumber[] = [];
-      for (let token of indexTokens) {
-        const erc20: IERC20 = await getContract(token, 'IERC20');
-        balances.push(await erc20.balanceOf(timelock));
-      }
-      await seller.takeTokensFromOwner(indexTokens);
-      for (let i = 0; i < indexTokens.length; i++) {
-        const token = indexTokens[i];
-        const oldBalance = balances[i];
-        const erc20: IERC20 = await getContract(token, 'IERC20');
-        expect(await erc20.balanceOf(timelock)).to.eq(0);
-        expect(await erc20.balanceOf(seller.address)).to.eq(oldBalance);
-      }
-    });
-  });
+  describe('takeTokensFromOwner()', () => {
+    it('Should transfer owner balance of each token to the seller', async () => {
+      await token.approve(seller.address, getBigNumber(1))
+      await token.mint(wallet.address, getBigNumber(1))
+      await expect(seller.takeTokensFromOwner([token.address]))
+        .to.emit(token, 'Transfer')
+        .withArgs(wallet.address, seller.address, getBigNumber(1))
+    })
 
-  describe('getBancorNDXForETHParams()', () => {
-    it('Should return params for ETH-NDX swap on Bancor', async () => {
-      // Specific to the forked block #
-      const params = await seller.getBancorNDXForETHParams(BigNumber.from(10).pow(18));
-      expect(params.path).to.deep.eq([
-        '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE',
-        '0xb1CD6e4153B2a390Cf00A6556b0fC1458C4A5533',
-        '0x1F573D6Fb3F13d689FF844B4cE37794d79a7FF1C',
-        '0xdc2e3142c5803e040FEb2d2E3c09c865FC5e3d0C',
-        '0x86772b1409b61c639EaAc9Ba0AcfBb6E238e5F83'
-      ]);
-      expect(params.bancor).to.eq('0x2F9EC37d6CcFFf1caB21733BdaDEdE11c823cCB0');
-      expect(params.amountOut).to.eq('0x250189f15e1e7612e5');
+    it('Should not do anything if owner has no balance', async () => {
+      await expect(seller.takeTokensFromOwner([token.address]))
+        .to.not.be.reverted
     })
   })
-  
-  describe('sellTokenForETH()', () => {
-    it('Should revert if token is ndx', async () => {
-      await expect(seller.sellTokenForETH('0x86772b1409b61c639EaAc9Ba0AcfBb6E238e5F83')).to.be.revertedWith('Can not sell NDX')
+
+  describe('setTWAPDiscountBips()', () => {
+    it('Should revert if not called by owner', async () => {
+      await expect(seller.connect(wallet1).setTWAPDiscountBips(1))
+        .to.be.revertedWith('Ownable: caller is not the owner')
     })
 
+    it('Should revert if discount over 10%', async () => {
+      await expect(seller.setTWAPDiscountBips(1001))
+        .to.be.revertedWith('Can not set discount >= 10%')
+    })
+
+    it('Should set discount bips', async () => {
+      await seller.setTWAPDiscountBips(1000)
+      expect(await seller.twapDiscountBips()).to.eq(1000)
+    })
+  })
+
+  describe('setEthToTreasuryBips()', () => {
+    it('Should revert if not called by owner', async () => {
+      await expect(seller.connect(wallet1).setEthToTreasuryBips(1))
+        .to.be.revertedWith('Ownable: caller is not the owner')
+    })
+
+    it('Should revert if over 100%', async () => {
+      await expect(seller.setEthToTreasuryBips(10001))
+        .to.be.revertedWith('Can not set bips over 100%')
+    })
+
+    it('Should set discount bips', async () => {
+      await seller.setEthToTreasuryBips(5000)
+      expect(await seller.ethToTreasuryBips()).to.eq(5000)
+    })
+  })
+
+  describe('returnTokens()', () => {
+    it('Should revert if not called by owner', async () => {
+      await expect(seller.connect(wallet1).returnTokens([token.address]))
+        .to.be.revertedWith('Ownable: caller is not the owner')
+    })
+
+    it('Should do nothing if account has no balance', async () => {
+      await expect(seller.returnTokens([ token.address, constants.AddressZero ]))
+        .to.not.be.reverted
+        .to.changeEtherBalances
+    })
+
+    it('Should transfer ETH balance if address is zero', async () => {
+      await sendEtherTo(seller.address, getBigNumber(1))
+      await expect(await seller.returnTokens([constants.AddressZero]))
+        .to.changeEtherBalances(
+          [{ getAddress: () => seller.address, provider: wallet.provider }, wallet],
+          [getBigNumber(-1), getBigNumber(1)]
+        )
+    })
+
+    it('Should transfer token balance if address is not zero', async () => {
+      await token.mint(seller.address, getBigNumber(1))
+      await expect(seller.returnTokens([token.address]))
+        .to.emit(token, 'Transfer')
+        .withArgs(seller.address, wallet.address, getBigNumber(1))
+    })
+  })
+
+  describe('getMinimumAmountOut()', () => {
+    it('Should revert if oracle has no observations', async () => {
+      await expect(seller.getMinimumAmountOut(token.address, getBigNumber(1)))
+        .to.be.revertedWith('IndexedUniswapV2Oracle::_getTokenPrice: No price found in provided range.')
+    })
+
+    it('Should return average value of token in ETH', async () => {
+      await updatePrice()
+      await advanceTimeAndBlock(duration.hours(3))
+      const average = await ORACLE.computeAverageEthForTokens(token.address, getBigNumber(1), duration.minutes(30), duration.days(2))
+      const minimum = average.sub(average.mul(500).div(10000))
+      expect(await seller.getMinimumAmountOut(token.address, getBigNumber(1)))
+        .to.eq(minimum)
+    })
+  })
+
+  describe('getBestPair()', () => {
+    it('Should return UNI if prices are the same', async () => {
+      const expectAmountOut = uni.getEthOut(getBigNumber(1))
+      const { pair, amountOut } = await seller.getBestPair(token.address, getBigNumber(1))
+      expect(pair).to.eq(uni.pair.address)
+      expect(amountOut).to.eq(expectAmountOut)
+    })
+
+    it('Should return SUSHI if price is better', async () => {
+      await uni.sellToken()
+      const expectAmountOut = sushi.getEthOut(getBigNumber(1))
+      const { pair, amountOut } = await seller.getBestPair(token.address, getBigNumber(1))
+      expect(pair).to.eq(sushi.pair.address)
+      expect(amountOut).to.eq(expectAmountOut)
+    })
+
+    it('Should not revert if SUSHI has no reserves', async () => {
+      ({ uni, sushi, token } = await createTokenWithEthPairs(true, false))
+      const expectAmountOut = uni.getEthOut(getBigNumber(1))
+      const { pair, amountOut } = await seller.getBestPair(token.address, getBigNumber(1))
+      expect(pair).to.eq(uni.pair.address)
+      expect(amountOut).to.eq(expectAmountOut)
+    })
+  })
+
+  describe('sellTokenForETH(address)', () => {
     it('Should revert if token is weth', async () => {
-      await expect(seller.sellTokenForETH('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2')).to.be.revertedWith('Can not sell WETH')
+      await expect(seller['sellTokenForETH(address)'](WETH_ADDRESS))
+        .to.be.revertedWith('Can not sell WETH')
     })
 
-    it('Should revert if no price available on oracle', async () => {
-      await expect(seller.sellTokenForETH(indexTokens[0])).to.be.revertedWith('IndexedUniswapV2Oracle::_getTokenPrice: No price found in provided range.')
+    it('Should revert if output is lower than minimum', async () => {
+      await token.mint(seller.address, getBigNumber(1))
+      await updatePrice()
+      await advanceTimeAndBlock(duration.hours(3))
+      await uni.sellToken(wallet.address, getBigNumber(5))
+      await sushi.sellToken(wallet.address, getBigNumber(5))
+      await expect(seller['sellTokenForETH(address)'](token.address))
+        .to.be.revertedWith('Insufficient output')
     })
 
-    it('Should sell tokens if output is >= TWAP - discount', async () => {
-      for (const token of indexTokens) {
-        await updatePrice(token);
-        await seller.sellTokenForETH(token);
-      }
-      const weth: IERC20 = await getContract('0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', 'IERC20')
-      console.log('Received', formatEther(await weth.balanceOf(seller.address)), 'ETH');
+    it('Should swap with UNI if price is the same', async () => {
+      await token.mint(seller.address, getBigNumber(1, 17))
+      await updatePrice()
+      await advanceTimeAndBlock(duration.hours(3))
+      const amountOut = uni.getEthOut(getBigNumber(1, 17))
+      await expect(seller['sellTokenForETH(address)'](token.address))
+        .to.emit(token, 'Transfer')
+        .withArgs(seller.address, uni.pair.address, getBigNumber(1, 17))
+        .to.emit(WETH, 'Transfer')
+        .withArgs(uni.pair.address, seller.address, amountOut)
+    })
+
+    it('Should swap with Sushi if price is better', async () => {
+      await token.mint(seller.address, getBigNumber(1, 17))
+      await updatePrice()
+      await advanceTimeAndBlock(duration.hours(3))
+      await uni.sellToken()
+      const amountOut = sushi.getEthOut(getBigNumber(1, 17))
+      await expect(seller['sellTokenForETH(address)'](token.address))
+        .to.emit(token, 'Transfer')
+        .withArgs(seller.address, sushi.pair.address, getBigNumber(1, 17))
+        .to.emit(WETH, 'Transfer')
+        .withArgs(sushi.pair.address, seller.address, amountOut)
     })
   })
 
-  describe('buyNDX()', () => {
-    it('Should revert if no price available on oracle', async () => {
-      await expect(seller.buyNDX()).to.be.revertedWith('IndexedUniswapV2Oracle::_getEthPrice: No price found in provided range.')
+  describe('sellTokenForETH(address,uint256)', () => {
+    it('Should revert if token is weth', async () => {
+      await expect(seller['sellTokenForETH(address,uint256)'](WETH_ADDRESS, 0))
+        .to.be.revertedWith('Can not sell WETH')
     })
 
-    it('Should buy NDX', async () => {
-      await updatePrice('0x86772b1409b61c639EaAc9Ba0AcfBb6E238e5F83')
-      await seller.buyNDX();
-      console.log(formatEther(await getBalance('0x86772b1409b61c639EaAc9Ba0AcfBb6E238e5F83', seller.address)))
-      console.log(formatEther(await getBalance('0x86772b1409b61c639EaAc9Ba0AcfBb6E238e5F83', dndx.address)))
+    it('Should revert if output is lower than minimum', async () => {
+      await token.mint(seller.address, getBigNumber(1))
+      await updatePrice()
+      await advanceTimeAndBlock(duration.hours(3))
+      await uni.sellToken(wallet.address, getBigNumber(5))
+      await sushi.sellToken(wallet.address, getBigNumber(5))
+      await expect(seller['sellTokenForETH(address,uint256)'](token.address, getBigNumber(1)))
+        .to.be.revertedWith('Insufficient output')
+    })
+
+    it('Should swap with UNI if price is the same', async () => {
+      await token.mint(seller.address, getBigNumber(1, 17))
+      await updatePrice()
+      await advanceTimeAndBlock(duration.hours(3))
+      const amountOut = uni.getEthOut(getBigNumber(1, 17))
+      await expect(seller['sellTokenForETH(address,uint256)'](token.address, getBigNumber(1, 17)))
+        .to.emit(token, 'Transfer')
+        .withArgs(seller.address, uni.pair.address, getBigNumber(1, 17))
+        .to.emit(WETH, 'Transfer')
+        .withArgs(uni.pair.address, seller.address, amountOut)
+    })
+
+    it('Should swap with Sushi if price is better', async () => {
+      await token.mint(seller.address, getBigNumber(1, 17))
+      await updatePrice()
+      await advanceTimeAndBlock(duration.hours(3))
+      await uni.sellToken()
+      const amountOut = sushi.getEthOut(getBigNumber(1, 17))
+      await expect(seller['sellTokenForETH(address,uint256)'](token.address, getBigNumber(1, 17)))
+        .to.emit(token, 'Transfer')
+        .withArgs(seller.address, sushi.pair.address, getBigNumber(1, 17))
+        .to.emit(WETH, 'Transfer')
+        .withArgs(sushi.pair.address, seller.address, amountOut)
+    })
+  })
+
+  describe('distributeETH()', () => {
+    it('Should wrap any eth held', async () => {
+      await sendEtherTo(seller.address, getBigNumber(1))
+      await expect(seller.distributeETH())
+        .to.emit(WETH, 'Deposit')
+        .withArgs(seller.address, getBigNumber(1))
+    })
+
+    it('Should not attempt to wrap if no eth held', async () => {
+      await expect(seller.distributeETH()).to.not.be.reverted
+    })
+
+    it('Should transfer to treasury and distribute the rest', async () => {
+      await sendEtherTo(seller.address, getBigNumber(1))
+      await mintWeth(seller.address, getBigNumber(1))
+      await expect(seller.distributeETH())
+        .to.emit(WETH, 'Deposit')
+        .withArgs(seller.address, getBigNumber(1))
+        .to.emit(WETH, 'Transfer')
+        .withArgs(seller.address, TREASURY_ADDRESS, getBigNumber(8, 17))
+        .to.emit(WETH, 'Transfer')
+        .withArgs(seller.address, dndx.address, getBigNumber(12, 17))
+        .to.emit(dndx, 'DividendsDistributed')
+        .withArgs(seller.address, getBigNumber(12, 17))
     })
   })
 });

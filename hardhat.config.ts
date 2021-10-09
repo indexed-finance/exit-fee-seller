@@ -28,11 +28,15 @@ export default {
     timeout: 60000
   },
   networks: {
+    coverage: {
+      allowUnlimitedContractSize: true,
+      url: 'http://localhost:8555'
+    },
     hardhat: {
-      allowUnlimitedContractSize: false,
+      allowUnlimitedContractSize: true,
       forking: {
         url: `https://eth-mainnet.alchemyapi.io/v2/${process.env.ALCHEMY_API_KEY}`,
-        blockNumber: 12569699
+        blockNumber: 13255220
       }
     },
     mainnet: configureNetwork('mainnet', 1),
